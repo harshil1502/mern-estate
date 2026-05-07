@@ -62,6 +62,7 @@ def run_walk_forward(
     train_frac: float = 0.7,
     select_by: str = "sharpe",
     sizer_factory: Callable[[], PositionSizer] | None = None,
+    wrap_strategy: Callable[[object], object] | None = None,
 ) -> WalkForwardResult:
     if n_folds < 1:
         raise ValueError("n_folds must be >= 1")
@@ -85,7 +86,8 @@ def run_walk_forward(
             continue
 
         is_report = run_sweep(
-            grid, is_bars, instrument, risk, initial_equity, sizer_factory=sizer_factory,
+            grid, is_bars, instrument, risk, initial_equity,
+            sizer_factory=sizer_factory, wrap_strategy=wrap_strategy,
         )
         top_in_sample = is_report.top(1, key=select_by)
         if not top_in_sample:
@@ -96,7 +98,8 @@ def run_walk_forward(
         # Re-run the winning params on OOS only.
         oos_grid = ParamGrid(strategy_name=grid.strategy_name, fixed=dict(best.params))
         oos_report = run_sweep(
-            oos_grid, oos_bars, instrument, risk, initial_equity, sizer_factory=sizer_factory,
+            oos_grid, oos_bars, instrument, risk, initial_equity,
+            sizer_factory=sizer_factory, wrap_strategy=wrap_strategy,
         )
         oos = oos_report.results[0]
 

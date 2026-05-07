@@ -23,8 +23,11 @@ from futures_bot.research import (
     run_sweep,
     run_walk_forward,
 )
+from futures_bot.research.monte_carlo import bootstrap_trade_returns
+from futures_bot.research.regimes import build_regime_detector
 from futures_bot.runner.paper import PaperRunner
 from futures_bot.strategies import build_strategy
+from futures_bot.strategies.regime_gated import RegimeGatedStrategy
 
 app = typer.Typer(add_completion=False, help="Futures algo bot — Tradovate / CME scaffold.")
 log = logging.getLogger("futures_bot")
@@ -165,6 +168,14 @@ def research(
         "",
         help="Override sizer, e.g. 'fixed:qty=1' or 'atr:risk_per_trade_pct=0.005,atr_period=14'.",
     ),
+    gate_regime: str = typer.Option(
+        "",
+        help="Gate trades by regime: e.g. 'vol' (vol-band) or 'hmm' (Gaussian HMM).",
+    ),
+    allowed_regimes: str = typer.Option(
+        "calm,low_vol,mid_vol",
+        help="Comma-separated regime labels in which entries are allowed.",
+    ),
     out_json: Path | None = typer.Option(None, help="Optional JSON dump of full report."),
 ) -> None:
     """Search strategies × params and report what (if anything) clears the daily-PnL goal."""
@@ -177,6 +188,16 @@ def research(
     sizer_spec = _parse_sizer_override(sizer) if sizer else cfg.sizing.model_dump()
     sizer_factory = lambda: build_sizer(sizer_spec)  # noqa: E731 — fresh sizer per combo
     typer.echo(f"Sizer: {sizer_spec}")
+
+    wrap_strategy = None
+    regime_kind = gate_regime.strip()
+    if regime_kind:
+        allowed = tuple(r.strip() for r in allowed_regimes.split(",") if r.strip())
+        typer.echo(f"Regime gate: {regime_kind} | allowed={allowed}")
+
+        def wrap_strategy(s):  # noqa: F811 — closure captures regime config per run
+            detector = build_regime_detector({"type": regime_kind})
+            return RegimeGatedStrategy(s, detector, allowed_regimes=allowed)
     raw = yaml.safe_load(grid.read_text()) or {}
     if not isinstance(raw, dict) or not raw:
         raise typer.BadParameter(f"grid file {grid} is empty or malformed")
@@ -215,7 +236,7 @@ def research(
         if folds <= 1:
             report = run_sweep(
                 param_grid, bars, cfg.instrument, cfg.risk, account_size,
-                sizer_factory=sizer_factory,
+                sizer_factory=sizer_factory, wrap_strategy=wrap_strategy,
             )
             top_n = report.top(top, key=select_by)
             for r in top_n:
@@ -230,7 +251,7 @@ def research(
             wf = run_walk_forward(
                 param_grid, bars, cfg.instrument, cfg.risk, account_size,
                 n_folds=folds, train_frac=train_frac, select_by=select_by,
-                sizer_factory=sizer_factory,
+                sizer_factory=sizer_factory, wrap_strategy=wrap_strategy,
             )
             _print_walk_forward(wf, goal)
             full_report["strategies"][strategy_name] = {
@@ -308,6 +329,60 @@ def _print_walk_forward(wf: Any, goal: GoalSpec) -> None:
         f"avg sharpe={avg_oos_sharpe:.2f}  avg med_day={avg_oos_med_daily:+.2f}  "
         f"(target ${goal.target_daily_pnl_usd:.0f})"
     )
+
+
+@app.command("mc-eval")
+def mc_eval(
+    config: Path = typer.Option(Path("config/config.yaml"), help="Bot config."),
+    csv: Path = typer.Option(..., help="CSV bars to backtest before bootstrapping."),
+    n_iter: int = typer.Option(2000, help="Number of bootstrap iterations."),
+    block_size: int = typer.Option(1, help="Block size (>1 preserves serial dep)."),
+    seed: int = typer.Option(7, help="Bootstrap PRNG seed."),
+    sizer: str = typer.Option("", help="Override sizer (same syntax as `research`)."),
+    gate_regime: str = typer.Option("", help="Optional regime gate: 'vol' or 'hmm'."),
+    allowed_regimes: str = typer.Option(
+        "calm,low_vol,mid_vol", help="Allowed regime labels for entries."
+    ),
+) -> None:
+    """Bootstrap a single backtest's trade PnLs to separate luck from edge."""
+    from futures_bot.backtest.engine import BacktestEngine
+
+    configure_logging(Secrets().log_level)
+    cfg = load_config(config)
+    bars = list_csv_bars(csv)
+    strategy = build_strategy(cfg.strategy.name, cfg.strategy.params)
+    if gate_regime.strip():
+        allowed = tuple(r.strip() for r in allowed_regimes.split(",") if r.strip())
+        detector = build_regime_detector({"type": gate_regime.strip()})
+        strategy = RegimeGatedStrategy(strategy, detector, allowed_regimes=allowed)
+    sizer_spec = _parse_sizer_override(sizer) if sizer else cfg.sizing.model_dump()
+    initial_equity = cfg.backtest.initial_equity_usd if cfg.backtest else 10_000.0
+    engine = BacktestEngine(
+        strategy, cfg.instrument, cfg.risk, initial_equity, sizer=build_sizer(sizer_spec),
+    )
+    result = engine.run(bars)
+
+    typer.echo(
+        f"\nBacktest: trades={result.num_trades} pnl=${result.realized_pnl:+,.2f} "
+        f"max_dd=${result.max_drawdown:,.2f}"
+    )
+    stats = bootstrap_trade_returns(
+        result, n_iter=n_iter, block_size=block_size, seed=seed,
+    )
+    typer.echo(f"\nMonte Carlo (n_iter={stats.n_iter}, block_size={block_size}):")
+    typer.echo(
+        f"  pnl mean=${stats.mean_pnl:+,.0f}  median=${stats.median_pnl:+,.0f}  "
+        f"5%=${stats.p05_pnl:+,.0f}  95%=${stats.p95_pnl:+,.0f}"
+    )
+    typer.echo(
+        f"  sharpe mean={stats.mean_sharpe:+.2f}  5%={stats.p05_sharpe:+.2f}  "
+        f"95%={stats.p95_sharpe:+.2f}"
+    )
+    typer.echo(
+        f"  max_dd mean=${stats.mean_max_dd:,.0f}  95%=${stats.p95_max_dd:,.0f}"
+    )
+    typer.echo(f"  pct_profitable: {stats.pct_profitable:.0%}")
+    typer.echo(f"\n  -> {stats.verdict}")
 
 
 @app.command()

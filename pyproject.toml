@@ -30,6 +30,10 @@ dev = [
 yahoo = [
     "yfinance>=0.2.40",
 ]
+research = [
+    "hmmlearn>=0.3",
+    "scikit-learn>=1.3",
+]
 
 [project.scripts]
 futures-bot = "futures_bot.cli:app"

@@ -43,8 +43,13 @@ def run_sweep(
     risk: RiskConfig,
     initial_equity: float,
     sizer_factory: Callable[[], PositionSizer] | None = None,
+    wrap_strategy: Callable[[object], object] | None = None,
 ) -> SweepReport:
-    """Run a grid against bars; `sizer_factory` builds a fresh sizer per combo."""
+    """Run a grid against bars.
+
+    `sizer_factory` builds a fresh sizer per combo.
+    `wrap_strategy` optionally wraps each base strategy (e.g. a regime gate).
+    """
     report = SweepReport()
     n_combos = grid.size()
     log.info("Sweeping %s × %d combos against %d bars",
@@ -53,6 +58,8 @@ def run_sweep(
     for i, params in enumerate(grid.expand(), start=1):
         try:
             strategy = build_strategy(grid.strategy_name, params)
+            if wrap_strategy is not None:
+                strategy = wrap_strategy(strategy)
             engine = BacktestEngine(strategy, instrument, risk, initial_equity, sizer=factory())
             result = engine.run(bars)
             metrics = compute_metrics(result, bars, initial_equity)
