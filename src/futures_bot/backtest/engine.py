@@ -7,6 +7,7 @@ from datetime import datetime
 
 from futures_bot.config import InstrumentConfig, RiskConfig
 from futures_bot.execution.risk import RiskManager, RiskRejection
+from futures_bot.execution.sizing import FixedQty, PositionSizer
 from futures_bot.strategies.base import Strategy
 from futures_bot.types import Bar, Position, Side
 
@@ -48,11 +49,13 @@ class BacktestEngine:
         instrument: InstrumentConfig,
         risk: RiskConfig,
         initial_equity: float = 10_000.0,
+        sizer: PositionSizer | None = None,
     ) -> None:
         self.strategy = strategy
         self.instrument = instrument
         self.risk_cfg = risk
         self.initial_equity = initial_equity
+        self.sizer = sizer or FixedQty(1)
 
     def run(self, bars: Iterable[Bar]) -> BacktestResult:
         position = Position(symbol=self.instrument.symbol)
@@ -64,6 +67,7 @@ class BacktestEngine:
         bars = list(bars)
         self.strategy.on_start()
         for i, bar in enumerate(bars):
+            self.sizer.update(bar)
             mark = bar.close
             unrealized = position.unrealized_pnl(mark, self.instrument.point_value)
             equity = self.initial_equity + result.realized_pnl + unrealized
@@ -73,7 +77,9 @@ class BacktestEngine:
             risk.on_equity(equity)
 
             try:
-                signal = risk.vet_signal(self.strategy.on_bar(bar, position), position)
+                raw_signal = self.strategy.on_bar(bar, position)
+                sized = self.sizer.size(raw_signal, position, equity, self.instrument)
+                signal = risk.vet_signal(sized, position)
             except RiskRejection as e:
                 log.info("risk rejected at %s: %s", bar.ts, e)
                 continue

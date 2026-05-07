@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from futures_bot.backtest.engine import BacktestEngine
 from futures_bot.config import InstrumentConfig, RiskConfig
+from futures_bot.execution.sizing import FixedQty, PositionSizer
 from futures_bot.research.grid import ParamGrid
 from futures_bot.research.metrics import StrategyMetrics, compute_metrics
 from futures_bot.strategies.registry import build_strategy
@@ -40,15 +42,18 @@ def run_sweep(
     instrument: InstrumentConfig,
     risk: RiskConfig,
     initial_equity: float,
+    sizer_factory: Callable[[], PositionSizer] | None = None,
 ) -> SweepReport:
+    """Run a grid against bars; `sizer_factory` builds a fresh sizer per combo."""
     report = SweepReport()
     n_combos = grid.size()
     log.info("Sweeping %s × %d combos against %d bars",
              grid.strategy_name, n_combos, len(bars))
+    factory = sizer_factory or (lambda: FixedQty(1))
     for i, params in enumerate(grid.expand(), start=1):
         try:
             strategy = build_strategy(grid.strategy_name, params)
-            engine = BacktestEngine(strategy, instrument, risk, initial_equity)
+            engine = BacktestEngine(strategy, instrument, risk, initial_equity, sizer=factory())
             result = engine.run(bars)
             metrics = compute_metrics(result, bars, initial_equity)
             report.results.append(

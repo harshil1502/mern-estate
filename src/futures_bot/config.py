@@ -54,11 +54,20 @@ class BacktestConfig(BaseModel):
     initial_equity_usd: float = 10_000.0
 
 
+class SizingConfig(BaseModel):
+    """Free-form sizer spec; `type` selects the implementation."""
+
+    type: str = "fixed"
+    # remaining keys are passed through to the sizer constructor
+    model_config = {"extra": "allow"}
+
+
 class AppConfig(BaseModel):
     runner: RunnerConfig
     instrument: InstrumentConfig
     strategy: StrategyConfig
     risk: RiskConfig
+    sizing: SizingConfig = Field(default_factory=SizingConfig)
     backtest: BacktestConfig | None = None
 
 

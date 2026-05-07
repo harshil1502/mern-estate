@@ -10,6 +10,7 @@ from typing import Any
 from futures_bot.brokers.base import Broker
 from futures_bot.config import AppConfig
 from futures_bot.execution.risk import RiskManager, RiskRejection
+from futures_bot.execution.sizing import FixedQty, PositionSizer
 from futures_bot.strategies.base import Strategy
 from futures_bot.types import OrderType
 
@@ -53,11 +54,13 @@ class PaperRunner:
         broker: Broker,
         strategy: Strategy,
         on_signal: Callable[[Any], None] | None = None,
+        sizer: PositionSizer | None = None,
     ) -> None:
         self.cfg = cfg
         self.broker = broker
         self.strategy = strategy
         self.risk = RiskManager(cfg.risk)
+        self.sizer = sizer or FixedQty(1)
         self.stats = RunStats()
         self._on_signal = on_signal
         self._stopped = asyncio.Event()
@@ -81,6 +84,7 @@ class PaperRunner:
                 if self._stopped.is_set():
                     break
                 self.stats.bars_seen += 1
+                self.sizer.update(bar)
 
                 position = await self.broker.get_position(symbol)
                 equity = await self.broker.get_account_equity()
@@ -88,9 +92,9 @@ class PaperRunner:
                 self.risk.on_equity(equity)
 
                 try:
-                    signal = self.risk.vet_signal(
-                        self.strategy.on_bar(bar, position), position
-                    )
+                    raw = self.strategy.on_bar(bar, position)
+                    sized = self.sizer.size(raw, position, equity, self.cfg.instrument)
+                    signal = self.risk.vet_signal(sized, position)
                 except RiskRejection as e:
                     self.stats.halted_reason = str(e)
                     log.warning("risk halted: %s", e)

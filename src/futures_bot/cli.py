@@ -13,6 +13,7 @@ from futures_bot.brokers.tradovate import TradovateBroker
 from futures_bot.config import Secrets, load_config
 from futures_bot.data.csv_feed import csv_bar_feed, list_csv_bars, write_bars_csv
 from futures_bot.data.synthetic import synthetic_bars
+from futures_bot.execution.sizing import build_sizer
 from futures_bot.journal import TradeJournal
 from futures_bot.logging_setup import configure_logging
 from futures_bot.research import (
@@ -43,10 +44,11 @@ def paper(
     broker = TradovateBroker(secrets)
     strategy = build_strategy(cfg.strategy.name, cfg.strategy.params)
 
+    sizer = build_sizer(cfg.sizing.model_dump())
     journal_ctx = TradeJournal(journal) if journal else nullcontext()
     with journal_ctx as j:
         on_signal = j if isinstance(j, TradeJournal) else None
-        runner = PaperRunner(cfg, broker, strategy, on_signal=on_signal)
+        runner = PaperRunner(cfg, broker, strategy, on_signal=on_signal, sizer=sizer)
         asyncio.run(runner.run())
 
 
@@ -67,6 +69,7 @@ def paper_sim(
 
     feed = csv_bar_feed(csv, speed_multiplier=speed)
     strategy = build_strategy(cfg.strategy.name, cfg.strategy.params)
+    sizer = build_sizer(cfg.sizing.model_dump())
 
     with TradeJournal(journal) as j:
         broker = PaperBroker(
@@ -77,7 +80,7 @@ def paper_sim(
             commission_per_contract=commission,
             on_fill=j,
         )
-        runner = PaperRunner(cfg, broker, strategy, on_signal=j)
+        runner = PaperRunner(cfg, broker, strategy, on_signal=j, sizer=sizer)
         stats = asyncio.run(runner.run())
 
     typer.echo(f"\nPaper-sim done — {stats.summary()}")
@@ -99,7 +102,10 @@ def backtest(
 
     bars = list_csv_bars(csv)
     strategy = build_strategy(cfg.strategy.name, cfg.strategy.params)
-    engine = BacktestEngine(strategy, cfg.instrument, cfg.risk, cfg.backtest.initial_equity_usd)
+    sizer = build_sizer(cfg.sizing.model_dump())
+    engine = BacktestEngine(
+        strategy, cfg.instrument, cfg.risk, cfg.backtest.initial_equity_usd, sizer=sizer,
+    )
     result = engine.run(bars)
     log.info(
         "Backtest done: trades=%d realized_pnl=%.2f final_equity=%.2f max_dd=%.2f",
@@ -155,6 +161,10 @@ def research(
     train_frac: float = typer.Option(0.7, help="In-sample fraction per fold."),
     select_by: str = typer.Option("sharpe", help="IS selection metric: sharpe|sortino|calmar|pnl."),
     top: int = typer.Option(5, help="Top-N to print per strategy in single-sweep mode."),
+    sizer: str = typer.Option(
+        "",
+        help="Override sizer, e.g. 'fixed:qty=1' or 'atr:risk_per_trade_pct=0.005,atr_period=14'.",
+    ),
     out_json: Path | None = typer.Option(None, help="Optional JSON dump of full report."),
 ) -> None:
     """Search strategies × params and report what (if anything) clears the daily-PnL goal."""
@@ -164,6 +174,9 @@ def research(
 
     configure_logging(Secrets().log_level)
     cfg = load_config(config)
+    sizer_spec = _parse_sizer_override(sizer) if sizer else cfg.sizing.model_dump()
+    sizer_factory = lambda: build_sizer(sizer_spec)  # noqa: E731 — fresh sizer per combo
+    typer.echo(f"Sizer: {sizer_spec}")
     raw = yaml.safe_load(grid.read_text()) or {}
     if not isinstance(raw, dict) or not raw:
         raise typer.BadParameter(f"grid file {grid} is empty or malformed")
@@ -200,7 +213,10 @@ def research(
         typer.echo(f"=== {strategy_name} ({param_grid.size()} combos) ===")
 
         if folds <= 1:
-            report = run_sweep(param_grid, bars, cfg.instrument, cfg.risk, account_size)
+            report = run_sweep(
+                param_grid, bars, cfg.instrument, cfg.risk, account_size,
+                sizer_factory=sizer_factory,
+            )
             top_n = report.top(top, key=select_by)
             for r in top_n:
                 _print_sweep_row(r, goal)
@@ -214,6 +230,7 @@ def research(
             wf = run_walk_forward(
                 param_grid, bars, cfg.instrument, cfg.risk, account_size,
                 n_folds=folds, train_frac=train_frac, select_by=select_by,
+                sizer_factory=sizer_factory,
             )
             _print_walk_forward(wf, goal)
             full_report["strategies"][strategy_name] = {
@@ -236,6 +253,23 @@ def research(
         out_json.parent.mkdir(parents=True, exist_ok=True)
         out_json.write_text(json.dumps(full_report, indent=2, default=str))
         typer.echo(f"Full report written to {out_json}")
+
+
+def _parse_sizer_override(spec: str) -> dict[str, Any]:
+    """Parse 'atr:risk_per_trade_pct=0.005,atr_period=14' into a sizer dict."""
+    if ":" not in spec:
+        return {"type": spec}
+    type_part, rest = spec.split(":", 1)
+    out: dict[str, Any] = {"type": type_part}
+    for kv in rest.split(","):
+        if not kv.strip():
+            continue
+        k, _, v = kv.partition("=")
+        try:
+            out[k.strip()] = int(v) if v.lstrip("-").isdigit() else float(v)
+        except ValueError:
+            out[k.strip()] = v.strip()
+    return out
 
 
 def _print_sweep_row(r: Any, goal: GoalSpec) -> None:

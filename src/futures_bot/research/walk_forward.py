@@ -12,11 +12,13 @@ The OOS score is the honest reading — IS optimization is biased by definition.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from futures_bot.config import InstrumentConfig, RiskConfig
+from futures_bot.execution.sizing import PositionSizer
 from futures_bot.research.grid import ParamGrid
 from futures_bot.research.metrics import StrategyMetrics
 from futures_bot.research.sweep import run_sweep
@@ -59,6 +61,7 @@ def run_walk_forward(
     n_folds: int = 5,
     train_frac: float = 0.7,
     select_by: str = "sharpe",
+    sizer_factory: Callable[[], PositionSizer] | None = None,
 ) -> WalkForwardResult:
     if n_folds < 1:
         raise ValueError("n_folds must be >= 1")
@@ -81,7 +84,9 @@ def run_walk_forward(
         if not is_bars or not oos_bars:
             continue
 
-        is_report = run_sweep(grid, is_bars, instrument, risk, initial_equity)
+        is_report = run_sweep(
+            grid, is_bars, instrument, risk, initial_equity, sizer_factory=sizer_factory,
+        )
         top_in_sample = is_report.top(1, key=select_by)
         if not top_in_sample:
             log.warning("fold %d: no valid IS results — skipping", fold_idx)
@@ -90,7 +95,9 @@ def run_walk_forward(
 
         # Re-run the winning params on OOS only.
         oos_grid = ParamGrid(strategy_name=grid.strategy_name, fixed=dict(best.params))
-        oos_report = run_sweep(oos_grid, oos_bars, instrument, risk, initial_equity)
+        oos_report = run_sweep(
+            oos_grid, oos_bars, instrument, risk, initial_equity, sizer_factory=sizer_factory,
+        )
         oos = oos_report.results[0]
 
         folds.append(
