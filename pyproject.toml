@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "futures-bot"
+version = "0.0.1"
+description = "Algorithmic futures trading bot scaffold (Tradovate / CME)."
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "websockets>=12",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "typer>=0.12",
+    "rich>=13.7",
+    "pandas>=2.2",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.1",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+futures-bot = "futures_bot.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+# B008: typer.Option() in defaults is idiomatic.
+# B027: Strategy.on_start/on_stop are intentional optional hooks.
+ignore = ["B008", "B027"]
