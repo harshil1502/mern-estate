@@ -29,6 +29,20 @@ def list_csv_bars(path: str | Path) -> list[Bar]:
     return bars
 
 
+def write_bars_csv(path: str | Path, bars: Iterable[Bar]) -> int:
+    """Write bars to CSV in the same schema list_csv_bars expects. Returns row count."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    with p.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["ts", "open", "high", "low", "close", "volume"])
+        for b in bars:
+            writer.writerow([b.ts.isoformat(), b.open, b.high, b.low, b.close, b.volume])
+            n += 1
+    return n
+
+
 async def csv_bar_feed(
     path: str | Path,
     speed_multiplier: float = 0.0,

@@ -27,6 +27,9 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
 ]
+yahoo = [
+    "yfinance>=0.2.40",
+]
 
 [project.scripts]
 futures-bot = "futures_bot.cli:app"

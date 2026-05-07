@@ -10,7 +10,8 @@ import typer
 from futures_bot.brokers.paper import PaperBroker
 from futures_bot.brokers.tradovate import TradovateBroker
 from futures_bot.config import Secrets, load_config
-from futures_bot.data.csv_feed import csv_bar_feed, list_csv_bars
+from futures_bot.data.csv_feed import csv_bar_feed, list_csv_bars, write_bars_csv
+from futures_bot.data.synthetic import synthetic_bars
 from futures_bot.journal import TradeJournal
 from futures_bot.logging_setup import configure_logging
 from futures_bot.runner.paper import PaperRunner
@@ -96,6 +97,40 @@ def backtest(
         "Backtest done: trades=%d realized_pnl=%.2f final_equity=%.2f max_dd=%.2f",
         result.num_trades, result.realized_pnl, result.final_equity, result.max_drawdown,
     )
+
+
+@app.command("fetch-history")
+def fetch_history(
+    source: str = typer.Option("synth", help="Data source: yahoo | synth."),
+    symbol: str = typer.Option("ES=F", help="Yahoo symbol (e.g. ES=F, MES=F, NQ=F)."),
+    interval: str = typer.Option("1m", help="Yahoo interval: 1m|5m|15m|1h|1d|..."),
+    period: str = typer.Option("5d", help="Yahoo period: 1d|5d|1mo|3mo|6mo|1y|max."),
+    out: Path = typer.Option(Path("data/history.csv"), help="Output CSV path."),
+    n: int = typer.Option(500, help="(synth) number of bars."),
+    bar_seconds: int = typer.Option(60, help="(synth) bar duration in seconds."),
+    start_price: float = typer.Option(4500.0, help="(synth) opening price."),
+    annual_vol: float = typer.Option(0.16, help="(synth) annualized volatility."),
+    seed: int = typer.Option(42, help="(synth) PRNG seed."),
+) -> None:
+    """Fetch historical bars and write a CSV the bot can replay.
+
+    `--source synth` is fully offline and deterministic; `--source yahoo`
+    pulls real data from Yahoo Finance (rate-limited; not exchange quality).
+    """
+    configure_logging(Secrets().log_level)
+    if source == "synth":
+        bars = synthetic_bars(
+            n=n, start_price=start_price, bar_seconds=bar_seconds,
+            annual_vol=annual_vol, seed=seed,
+        )
+    elif source == "yahoo":
+        from futures_bot.data.yahoo import fetch_yahoo_bars
+        bars = fetch_yahoo_bars(symbol, interval=interval, period=period)
+    else:
+        raise typer.BadParameter(f"unknown source '{source}' (use yahoo|synth)")
+
+    rows = write_bars_csv(out, bars)
+    typer.echo(f"Wrote {rows} bars to {out}")
 
 
 @app.command()
