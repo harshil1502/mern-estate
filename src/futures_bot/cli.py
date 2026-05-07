@@ -4,6 +4,7 @@ import asyncio
 import logging
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 
 import typer
 
@@ -14,6 +15,13 @@ from futures_bot.data.csv_feed import csv_bar_feed, list_csv_bars, write_bars_cs
 from futures_bot.data.synthetic import synthetic_bars
 from futures_bot.journal import TradeJournal
 from futures_bot.logging_setup import configure_logging
+from futures_bot.research import (
+    GoalSpec,
+    ParamGrid,
+    evaluate_goal,
+    run_sweep,
+    run_walk_forward,
+)
 from futures_bot.runner.paper import PaperRunner
 from futures_bot.strategies import build_strategy
 
@@ -131,6 +139,141 @@ def fetch_history(
 
     rows = write_bars_csv(out, bars)
     typer.echo(f"Wrote {rows} bars to {out}")
+
+
+@app.command()
+def research(
+    config: Path = typer.Option(Path("config/config.yaml"), help="Bot config (instrument/risk)."),
+    grid: Path = typer.Option(
+        Path("configs/research_grid.example.yaml"),
+        help="Strategy grid YAML (see configs/research_grid.example.yaml).",
+    ),
+    csv: Path = typer.Option(..., help="CSV of bars to evaluate against."),
+    account_size: float = typer.Option(150_000.0, help="Account size, USD."),
+    target_daily_pnl: float = typer.Option(500.0, help="Target daily PnL, USD."),
+    folds: int = typer.Option(5, help="Walk-forward folds (1 = single sweep, no WF)."),
+    train_frac: float = typer.Option(0.7, help="In-sample fraction per fold."),
+    select_by: str = typer.Option("sharpe", help="IS selection metric: sharpe|sortino|calmar|pnl."),
+    top: int = typer.Option(5, help="Top-N to print per strategy in single-sweep mode."),
+    out_json: Path | None = typer.Option(None, help="Optional JSON dump of full report."),
+) -> None:
+    """Search strategies × params and report what (if anything) clears the daily-PnL goal."""
+    import json
+
+    import yaml
+
+    configure_logging(Secrets().log_level)
+    cfg = load_config(config)
+    raw = yaml.safe_load(grid.read_text()) or {}
+    if not isinstance(raw, dict) or not raw:
+        raise typer.BadParameter(f"grid file {grid} is empty or malformed")
+
+    bars = list_csv_bars(csv)
+    if len(bars) < 100:
+        raise typer.BadParameter(f"need >= 100 bars, got {len(bars)} in {csv}")
+
+    goal = GoalSpec(target_daily_pnl_usd=target_daily_pnl, account_size_usd=account_size)
+    typer.echo(
+        f"\nGoal: ${target_daily_pnl:.0f}/day on ${account_size:,.0f} "
+        f"= {goal.required_daily_return * 100:.3f}%/day "
+        f"= {goal.required_annualized_return * 100:.0f}%/year"
+    )
+    typer.echo(f"Bars: {len(bars)}  ({bars[0].ts.date()} -> {bars[-1].ts.date()})\n")
+
+    full_report: dict[str, Any] = {
+        "goal": {
+            "target_daily_pnl": target_daily_pnl,
+            "account_size": account_size,
+            "required_daily_return": goal.required_daily_return,
+            "required_annualized_return": goal.required_annualized_return,
+        },
+        "n_bars": len(bars),
+        "strategies": {},
+    }
+
+    for strategy_name, spec in raw.items():
+        param_grid = ParamGrid(
+            strategy_name=strategy_name,
+            params=spec.get("params", {}) or {},
+            fixed=spec.get("fixed", {}) or {},
+        )
+        typer.echo(f"=== {strategy_name} ({param_grid.size()} combos) ===")
+
+        if folds <= 1:
+            report = run_sweep(param_grid, bars, cfg.instrument, cfg.risk, account_size)
+            top_n = report.top(top, key=select_by)
+            for r in top_n:
+                _print_sweep_row(r, goal)
+            full_report["strategies"][strategy_name] = {
+                "mode": "single_sweep",
+                "top": [
+                    {"params": r.params, **r.metrics.as_row()} for r in top_n
+                ],
+            }
+        else:
+            wf = run_walk_forward(
+                param_grid, bars, cfg.instrument, cfg.risk, account_size,
+                n_folds=folds, train_frac=train_frac, select_by=select_by,
+            )
+            _print_walk_forward(wf, goal)
+            full_report["strategies"][strategy_name] = {
+                "mode": "walk_forward",
+                "n_folds": len(wf.folds),
+                "aggregated_oos_pnl": wf.aggregated_oos_pnl,
+                "aggregated_oos_trades": wf.aggregated_oos_trades,
+                "folds": [
+                    {
+                        "fold": f.fold,
+                        "params": f.best_params,
+                        "is_metrics": f.is_metrics.as_row(),
+                        "oos_metrics": f.oos_metrics.as_row(),
+                    } for f in wf.folds
+                ],
+            }
+        typer.echo("")
+
+    if out_json is not None:
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        out_json.write_text(json.dumps(full_report, indent=2, default=str))
+        typer.echo(f"Full report written to {out_json}")
+
+
+def _print_sweep_row(r: Any, goal: GoalSpec) -> None:
+    m = r.metrics
+    assessment = evaluate_goal(m, goal)
+    flag = "✓" if assessment.median_meets_target else "✗"
+    typer.echo(
+        f"  {flag} params={r.params}  "
+        f"pnl={m.realized_pnl:+.2f}  sharpe={m.sharpe_annualized:.2f}  "
+        f"trades={m.num_trades}  win={m.win_rate:.0%}  "
+        f"med_day={m.median_daily_pnl:+.2f}  max_dd={m.max_drawdown:.2f}"
+    )
+
+
+def _print_walk_forward(wf: Any, goal: GoalSpec) -> None:
+    if not wf.folds:
+        typer.echo("  (no folds completed)")
+        return
+    total_pnl = wf.aggregated_oos_pnl
+    avg_oos_sharpe = sum(f.oos_metrics.sharpe_annualized for f in wf.folds) / len(wf.folds)
+    avg_oos_med_daily = sum(f.oos_metrics.median_daily_pnl for f in wf.folds) / len(wf.folds)
+    typer.echo(
+        f"  Walk-forward over {len(wf.folds)} folds, select_by={wf.select_by}"
+    )
+    for f in wf.folds:
+        typer.echo(
+            f"    fold {f.fold}: params={f.best_params}  "
+            f"OOS pnl={f.oos_metrics.realized_pnl:+.2f}  "
+            f"sharpe={f.oos_metrics.sharpe_annualized:.2f}  "
+            f"trades={f.oos_metrics.num_trades}  "
+            f"med_day={f.oos_metrics.median_daily_pnl:+.2f}"
+        )
+    flag = "✓" if avg_oos_med_daily >= goal.target_daily_pnl_usd else "✗"
+    typer.echo(
+        f"  {flag} aggregated OOS pnl={total_pnl:+.2f}  "
+        f"avg sharpe={avg_oos_sharpe:.2f}  avg med_day={avg_oos_med_daily:+.2f}  "
+        f"(target ${goal.target_daily_pnl_usd:.0f})"
+    )
 
 
 @app.command()
