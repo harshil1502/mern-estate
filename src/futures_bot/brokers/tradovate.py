@@ -1,10 +1,11 @@
-"""Tradovate REST + (stubbed) WebSocket broker.
+"""Tradovate REST + market-data WebSocket broker.
 
 Auth flow reference: https://api.tradovate.com/#tag/Authentication
+Real-time data reference: https://api.tradovate.com/#section/Real-time-Data
 
 The demo environment uses `demo.tradovateapi.com`; live uses `live.tradovateapi.com`.
-This module implements auth + a small, typed surface used by the runner.
-WebSocket streaming is intentionally a stub — wire it up per the strategy you ship.
+Market data flows over a separate WebSocket (`md.tradovateapi.com`) handled by
+`TradovateMD`; this class composes both REST + MD into the `Broker` interface.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from typing import Any
 import httpx
 
 from futures_bot.brokers.base import Broker
+from futures_bot.brokers.tradovate_md import TradovateMD
 from futures_bot.config import Secrets
 from futures_bot.types import Bar, Order, OrderStatus, OrderType, Position, Side
 
@@ -42,6 +44,7 @@ class TradovateBroker(Broker):
         self._access_token: str | None = None
         self._token_expiry: datetime | None = None
         self._account_id: int | None = None
+        self._md_client: TradovateMD | None = None
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -53,6 +56,9 @@ class TradovateBroker(Broker):
                  self._secrets.tradovate_env, self._account_id)
 
     async def close(self) -> None:
+        if self._md_client is not None:
+            await self._md_client.close()
+            self._md_client = None
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -208,6 +214,19 @@ class TradovateBroker(Broker):
 
     # --- market data ---------------------------------------------------------
 
+    def _md(self) -> TradovateMD:
+        if self._md_client is None:
+            if self._access_token is None:
+                raise RuntimeError("call connect() first")
+            self._md_client = TradovateMD(self._access_token)
+        return self._md_client
+
+    async def _ensure_md(self) -> TradovateMD:
+        md = self._md()
+        if not md.is_connected:
+            await md.connect()
+        return md
+
     async def historical_bars(
         self,
         symbol: str,
@@ -215,20 +234,35 @@ class TradovateBroker(Broker):
         end: datetime,
         bar_seconds: int,
     ) -> list[Bar]:
-        # NOTE: Tradovate's historical chart data flows over a separate
-        # WebSocket (md.tradovateapi.com /v1/websocket) using `md/getChart`.
-        # Wire that up before relying on this in production. Returning [] keeps
-        # the surface honest for the scaffold.
-        log.warning("historical_bars not wired up — returning []")
-        return []
+        """Pull historical bars by tapping the live chart subscription.
 
-    async def stream_bars(self, symbol: str, bar_seconds: int) -> AsyncIterator[Bar]:  # type: ignore[override]
-        # Same note as above — replace with a websockets.connect() loop that
-        # subscribes to md/subscribeQuote or md/subscribeChart and aggregates
-        # ticks into bars of `bar_seconds`.
-        raise NotImplementedError("stream_bars: implement websocket market data feed")
-        if False:  # pragma: no cover - keeps return type AsyncIterator[Bar]
-            yield  # type: ignore[unreachable]
+        Tradovate streams history first when you ask for `asMuchAsElements=N`,
+        so we estimate N from (end-start)/bar_seconds, drain the queue once,
+        filter to the [start, end] window, and unsubscribe.
+        """
+        md = await self._ensure_md()
+        span = max(0.0, (end - start).total_seconds())
+        approx = max(1, int(span // bar_seconds) + 5)
+        bars: list[Bar] = []
+        # Stream bars and stop once we've accumulated enough history past `end`,
+        # or we've drained the historical chunk (next bars arrive at live cadence).
+        async for bar in md.stream_chart(symbol, bar_seconds, history_elements=approx):
+            if start <= bar.ts <= end:
+                bars.append(bar)
+            if bar.ts > end:
+                break
+            if len(bars) >= approx:
+                break
+        return bars
+
+    async def stream_bars(  # type: ignore[override]
+        self,
+        symbol: str,
+        bar_seconds: int,
+    ) -> AsyncIterator[Bar]:
+        md = await self._ensure_md()
+        async for bar in md.stream_chart(symbol, bar_seconds, history_elements=1):
+            yield bar
 
 
 def _order_type_to_tradovate(t: OrderType) -> str:
