@@ -1,0 +1,26 @@
+# Default search space for `futures-bot research`.
+# Each top-level key is a strategy name in the registry; values are param grids.
+# `fixed` keys are passed through unchanged on every combo.
+
+ema_crossover:
+  fixed:
+    bar_seconds: 60
+  params:
+    fast: [3, 5, 8, 13, 21]
+    slow: [21, 34, 55, 89]
+
+bollinger_revert:
+  fixed:
+    bar_seconds: 60
+    allow_short: true
+  params:
+    period: [10, 20, 30, 50]
+    z: [1.5, 2.0, 2.5, 3.0]
+
+donchian_breakout:
+  fixed:
+    bar_seconds: 60
+    allow_short: true
+  params:
+    entry_period: [10, 20, 30, 55]
+    exit_period: [5, 10, 20]

@@ -1,0 +1,27 @@
+runner:
+  mode: paper          # paper | live | backtest
+  loop_interval_s: 5
+
+instrument:
+  symbol: MESM6        # Micro E-mini S&P 500, Jun 2026 contract
+  exchange: CME
+  tick_size: 0.25
+  point_value: 5       # USD per point (MES = $5/pt)
+
+strategy:
+  name: ema_crossover
+  params:
+    fast: 9
+    slow: 21
+    bar_seconds: 60
+
+risk:
+  max_position: 1
+  per_trade_risk_usd: 50
+  daily_loss_limit_usd: 200
+  kill_switch_drawdown_usd: 500
+
+backtest:
+  start: 2025-01-01
+  end: 2025-04-01
+  initial_equity_usd: 10000
